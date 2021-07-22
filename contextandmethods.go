@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"fmt"
@@ -16,7 +17,7 @@ import (
 )
 
 type Source interface {
-	NewAgent() (*AgentServer, error)
+	NewAgent(ctx context.Context) (*AgentServer, context.Context, error)
 }
 type SSHSocketFwd struct {
 	SourcePath string
@@ -90,32 +91,40 @@ func NewSource(paths []string) (Source, error) {
 	return NewKeySource(keys)
 }
 
-func (s *SSHKeyFwd) NewAgent() (*AgentServer, error) {
+func (s *SSHKeyFwd) NewAgent(ctx context.Context) (*AgentServer, context.Context, error) {
 	a := agent.NewKeyring()
 	for _, k := range s.Keys {
 		if err := a.Add(agent.AddedKey{PrivateKey: k}); err != nil {
-			return nil, errors.Wrap(err, "failed to create ssh agent")
+			return nil, nil, errors.Wrap(err, "failed to create ssh agent")
 		}
 	}
+	ctx, cancel := context.WithCancel(ctx)
 
 	return &AgentServer{
-		Agent: a,
-	}, nil
+		Agent:  a,
+		Cancel: cancel,
+	}, ctx, nil
 }
 
-func (s *SSHSocketFwd) NewAgent() (*AgentServer, error) {
+func (s *SSHSocketFwd) NewAgent(ctx context.Context) (*AgentServer, context.Context, error) {
 	conn, err := net.Dial("unix", s.SourcePath)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	ac := agent.NewClient(conn)
 	// defer conn.Close()
+	ctx, cancel := context.WithCancel(ctx)
+
 	return &AgentServer{
-		Agent: ac,
-	}, nil
+		Agent:  ac,
+		Cancel: cancel,
+	}, ctx, nil
 }
 
-func (a *AgentServer) ServeAgent(ctx context.Context) error { // this function also probably needs waitgroup
+func (a *AgentServer) ServeAgent(ctx context.Context, wg *sync.WaitGroup) error { // this function also probably needs waitgroup
+	if wg != nil {
+		defer wg.Done()
+	}
 	// serveDir, err := ioutil.TempDir("", ".buildah-ssh-sock")
 	// if err != nil {
 	// 	return err
@@ -155,16 +164,17 @@ func drive() (context.CancelFunc, error) {
 	if err != nil {
 		return nil, err
 	}
-	ag, err := source.NewAgent()
+	ctx := context.Background()
+	ag, ctx, err := source.NewAgent(ctx)
 	// listofagents := append(listofagents, ag)
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	ag.Cancel = cancel
+	// ctx, cancel := context.WithCancel(context.Background())
+	// ag.Cancel = cancel
 	// waitGroup.Add(1)
 	// go ag.ServeAgent(ctx, waitgroup)
-	go ag.ServeAgent(ctx)
+	go ag.ServeAgent(ctx, nil)
 	// ^^ end of for loop
 
 	// buildah, some work is done here
@@ -173,27 +183,9 @@ func drive() (context.CancelFunc, error) {
 	// in buildah, there's a defer cleanuprunmounts(agnet, waitgroup) here that should clean up agents
 
 	// waitGroup.Wait()
-	return cancel, nil
+	return nil, nil
 }
 
-// func pretnedbuildah(sources map[string]Source, sshids []string) {
-// 	var agents []AgentServer
-// 	for _, id := range sshids {
-// 		if src, ok := sources[id]; !ok {
-// 			ag, err := src.NewAgent()
-// 			agents.Appe
-// 		}
-// 	}
-// }
-
-// func cleanuprunmounts(agents, waitgroup ,...){
-// 	for agent:- range agent{
-// 		agent.Cancel()
-// 		might also need to cleanup some other connections?
-//  ...
-// 	}
-
-// }
 func m() {
 	cancel, _ := drive()
 	time.Sleep(5 * time.Second)
@@ -203,6 +195,50 @@ func m() {
 	time.Sleep(2 * time.Second)
 	aaaa(1)
 
+}
+
+func pretendbuildah(sources map[string]Source, sshids []string) error {
+	var agents []*AgentServer
+	waitGroup := sync.WaitGroup{}
+	for _, id := range sshids {
+		if src, ok := sources[id]; !ok {
+			ctx := context.Background()
+			ag, ctx, err := src.NewAgent(ctx)
+			if err != nil {
+				return err
+			}
+			agents = append(agents, ag)
+			waitGroup.Add(1)
+			go ag.ServeAgent(ctx, &waitGroup)
+		}
+	}
+	time.Sleep(3 * time.Second) //pretend buildah is doing work here
+	//shut down everything
+	for _, toclose := range agents {
+		toclose.Cancel()
+	}
+	waitGroup.Wait()
+	return nil
+}
+
+// func cleanuprunmounts(agents, waitgroup ,...){
+// 	for agent:- range agent{
+// 		agent.Cancel()
+// 		might also need to cleanup some other connections?
+//  ...
+// 	}
+
+// }
+func m2() error {
+	path := os.Getenv("SSH_AUTH_SOCK")
+	source, err := NewSource([]string{path})
+	if err != nil {
+		return err
+	}
+	sources := make(map[string]Source)
+	sources["default"] = source
+	pretendbuildah(sources, []string{"id"})
+	return nil
 }
 
 func aaaa(i int) error {
